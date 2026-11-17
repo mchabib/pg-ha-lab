@@ -1,0 +1,125 @@
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.5.15
+  restart: unless-stopped
+  environment: &etcd-env
+    ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+    ETCD_INITIAL_CLUSTER_STATE: new
+    ETCD_INITIAL_CLUSTER_TOKEN: pg-ha-lab
+    ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+    ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    ETCD_ENABLE_V2: "false"
+
+x-pg: &pg
+  build: ./patroni
+  image: pg-ha-lab/patroni:16
+  restart: unless-stopped
+  depends_on: [etcd1, etcd2, etcd3]
+  environment: &pg-env
+    PATRONI_ETCD3_HOSTS: 172.31.250.11:2379,172.31.250.12:2379,172.31.250.13:2379
+    PATRONI_SUPERUSER_USERNAME: postgres
+    PATRONI_SUPERUSER_PASSWORD: ${PG_SUPERUSER_PASSWORD:-lab-superuser}
+    PATRONI_REPLICATION_USERNAME: replicator
+    PATRONI_REPLICATION_PASSWORD: ${PG_REPLICATION_PASSWORD:-lab-replicator}
+    PATRONI_REWIND_USERNAME: rewinder
+    PATRONI_REWIND_PASSWORD: ${PG_REWIND_PASSWORD:-lab-rewinder}
+
+services:
+  etcd1:
+    networks:
+      lab: { ipv4_address: 172.31.250.11 }
+    <<: *etcd
+    command: ["etcd", "--name", "etcd1", "--initial-advertise-peer-urls", "http://etcd1:2380", "--advertise-client-urls", "http://etcd1:2379", "--data-dir", "/etcd-data"]
+    volumes: [etcd1:/etcd-data]
+  etcd2:
+    networks:
+      lab: { ipv4_address: 172.31.250.12 }
+    <<: *etcd
+    command: ["etcd", "--name", "etcd2", "--initial-advertise-peer-urls", "http://etcd2:2380", "--advertise-client-urls", "http://etcd2:2379", "--data-dir", "/etcd-data"]
+    volumes: [etcd2:/etcd-data]
+  etcd3:
+    networks:
+      lab: { ipv4_address: 172.31.250.13 }
+    <<: *etcd
+    command: ["etcd", "--name", "etcd3", "--initial-advertise-peer-urls", "http://etcd3:2380", "--advertise-client-urls", "http://etcd3:2379", "--data-dir", "/etcd-data"]
+    volumes: [etcd3:/etcd-data]
+
+  pg1:
+    networks:
+      lab: { ipv4_address: 172.31.250.21 }
+    <<: *pg
+    hostname: pg1
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg1
+      PATRONI_RESTAPI_CONNECT_ADDRESS: 172.31.250.21:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: 172.31.250.21:5432
+    volumes: [pg1:/var/lib/postgresql/patroni]
+  pg2:
+    networks:
+      lab: { ipv4_address: 172.31.250.22 }
+    <<: *pg
+    hostname: pg2
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg2
+      PATRONI_RESTAPI_CONNECT_ADDRESS: 172.31.250.22:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: 172.31.250.22:5432
+    volumes: [pg2:/var/lib/postgresql/patroni]
+  pg3:
+    networks:
+      lab: { ipv4_address: 172.31.250.23 }
+    <<: *pg
+    hostname: pg3
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg3
+      PATRONI_RESTAPI_CONNECT_ADDRESS: 172.31.250.23:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: 172.31.250.23:5432
+    volumes: [pg3:/var/lib/postgresql/patroni]
+
+  haproxy:
+    networks:
+      lab: { ipv4_address: 172.31.250.30 }
+    image: haproxy:2.9-alpine
+    restart: unless-stopped
+    depends_on: [pg1, pg2, pg3]
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "127.0.0.1:5000:5000"   # read-write (leader)
+      - "127.0.0.1:5001:5001"   # read-only (replicas)
+      - "127.0.0.1:7000:7000"   # stats page
+
+  # psql/pgbench client used by the demo scripts
+  client:
+    networks:
+      lab: { ipv4_address: 172.31.250.40 }
+    image: pg-ha-lab/patroni:16
+    depends_on: [haproxy]
+    entrypoint: ["sleep", "infinity"]
+    healthcheck:
+      disable: true
+    environment:
+      PGHOST: haproxy
+      PGPORT: "5000"
+      PGUSER: postgres
+      PGPASSWORD: ${PG_SUPERUSER_PASSWORD:-lab-superuser}
+      PGDATABASE: postgres
+      PGCONNECT_TIMEOUT: "2"
+
+# Static IPs: replication and HAProxy use addresses, not names. When a node
+# dies, Docker drops its DNS name; a replica's walreceiver then blocks in a
+# DNS lookup for the dead leader, and promotion waits for it (seen: 43 s).
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+
+volumes:
+  etcd1:
+  etcd2:
+  etcd3:
+  pg1:
+  pg2:
+  pg3:
